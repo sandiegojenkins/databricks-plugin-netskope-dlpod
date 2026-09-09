@@ -10,10 +10,12 @@ live model and tool traffic.
 > ALB. It deploys only the Databricks-side adapter — not the appliance
 > itself. See [`NOTICE`](NOTICE).
 
-📄 **See [`Netskope-DLPoD-Databricks-Solutions-Guide.docx`](Netskope-DLPoD-Databricks-Solutions-Guide.docx)**
-for the full, illustrated, step-by-step deployment guide (architecture
-diagram, prerequisites, every step, troubleshooting, and the full API
-reference). This README is the quick-reference version.
+📄 Two hand-off documents, both with screenshot placeholders to fill in from your own setup:
+
+- **[`Netskope-DLPoD-Databricks-Quickstart-Guide.docx`](Netskope-DLPoD-Databricks-Quickstart-Guide.docx)** — a short checklist-style walkthrough (prerequisites + 4 steps) if you already know the architecture and just want the steps.
+- **[`Netskope-DLPoD-Databricks-Solutions-Guide.docx`](Netskope-DLPoD-Databricks-Solutions-Guide.docx)** — the full illustrated guide (architecture diagram, every step explained, troubleshooting, and the full API reference).
+
+This README is the quick-reference version.
 
 ---
 
@@ -131,6 +133,7 @@ deploy-databricks-adapter.ps1  Deploys the adapter
 docs/
   databricks-adapter.md        Adapter technical reference + troubleshooting
   dlpod-databricks-flow.excalidraw   Editable diagram of the call flow
+Netskope-DLPoD-Databricks-Quickstart-Guide.docx  Short checklist-style deployment guide
 Netskope-DLPoD-Databricks-Solutions-Guide.docx   Full illustrated deployment guide
 CLAUDE.md                      Guidance for Claude Code working in this repo
 NOTICE / LICENSE                Apache-2.0

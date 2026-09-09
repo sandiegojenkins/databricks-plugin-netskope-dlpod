@@ -1,0 +1,610 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Translation adapter between the Databricks Unity AI Gateway "External
+  Policy Direct HTTP API" and the Netskope DLP on Demand (DLPoD) sync
+  content inspection API. Databricks POSTs {event, config} to this API; the
+  Lambda extracts the text under evaluation, builds a multipart/form-data
+  request to DLPoD's /inspections endpoint (sha256 content id required),
+  parses the multipart/mixed response, and returns the flat {result, reason}
+  verdict the Databricks contract requires. Auth is OAuth2 client-credentials
+  (Cognito), the only method the Databricks contract supports; DLPoD's own
+  API requires no auth (network-gated only).
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC the DLPoD appliance (and its internal ALB) runs in.
+
+  LambdaSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Subnet(s) for the Lambda's VPC attachment. Any subnet in the same VPC
+      as the internal ALB works - the Lambda only needs VPC-local
+      reachability to it and DNS resolution of the private hosted zone; it
+      does not need NAT/internet egress.
+
+  DlpEvaluationUrl:
+    Type: String
+    Default: https://dlp.dlpod.internal/inspections
+    Description: Full URL of the DLPoD sync content inspection API (internal ALB).
+
+  CertParameterName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /netskope-dlpod/dlpod-cert
+    Description: >
+      SSM parameter holding the ALB's self-signed cert PEM (output by the
+      dlpod-standalone stack). Resolved at deploy time and baked into the
+      Lambda's environment so no runtime SSM call/network egress is needed.
+
+  DefaultProfiles:
+    Type: String
+    Default: ''
+    Description: >
+      Optional fallback DLP profile name(s), comma-separated (e.g.
+      "DLP-PII,DLP-PCI"), used if a Databricks attachment's policy_config
+      doesn't supply its own. Leave blank to require every attachment to
+      pass its own profiles.
+
+  GenerateIncidents:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Sets the x-netskope-generate-incidents request header on every DLPoD
+      /inspections call. Without this header (or set to false), DLPoD does
+      NOT post alerts/incidents to the management plane - matches would
+      still correctly DENY, but nothing shows up in SkopeIT. Leave 'true'
+      unless you have a specific reason to inspect without logging.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - LambdaSubnetIds
+      - Label:
+          default: DLPoD Backend
+        Parameters:
+          - DlpEvaluationUrl
+          - CertParameterName
+          - DefaultProfiles
+          - GenerateIncidents
+
+Resources:
+
+  # =========================================================
+  # Auth - OAuth2 client-credentials (M2M). The Databricks contract
+  # supports ONLY OAuth M2M (no API key / Basic / OAuth U2M): the customer
+  # configures Host, path, Client ID/Secret, Token endpoint, and scope on
+  # their UC HTTP Connection, and Databricks fetches + attaches the bearer
+  # token itself. Cognito's client-credentials flow gives us a real token
+  # endpoint with zero custom auth code - API Gateway's native JWT
+  # authorizer validates the token before the Lambda ever runs.
+  # =========================================================
+
+  AdapterUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: databricks-dlpod-adapter
+
+  AdapterUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref AdapterUserPool
+      Domain: !Sub 'databricks-dlpod-${AWS::AccountId}'
+
+  AdapterResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref AdapterUserPool
+      Identifier: dlpod
+      Name: DLPoD Evaluation
+      Scopes:
+        - ScopeName: evaluate
+          ScopeDescription: Evaluate content against DLPoD
+
+  AdapterAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: AdapterResourceServer
+    Properties:
+      UserPoolId: !Ref AdapterUserPool
+      ClientName: databricks-external-policy
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: ['dlpod/evaluate']
+      SupportedIdentityProviders: [COGNITO]
+
+  # =========================================================
+  # Lambda - the adapter itself
+  # =========================================================
+
+  AdapterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Databricks to DLPoD adapter Lambda (egress-only)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: To the internal ALB (VPC-local), no internet egress used
+      Tags:
+        - Key: Name
+          Value: databricks-dlpod-adapter-sg
+
+  AdapterExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  AdapterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      # 10s, not 8s: image content adds a best-effort remote-URL fetch step
+      # (~2s) ahead of the DLPoD inspection call(s) (~4s, run concurrently
+      # with each other, not serially) - see the image-handling comments
+      # below for why this can approach/exceed Databricks' ~5s budget.
+      Timeout: 10
+      MemorySize: 256
+      Role: !GetAtt AdapterExecutionRole.Arn
+      VpcConfig:
+        SubnetIds: !Ref LambdaSubnetIds
+        SecurityGroupIds:
+          - !Ref AdapterSecurityGroup
+      Environment:
+        Variables:
+          DLP_URL: !Ref DlpEvaluationUrl
+          CA_CERT_PEM: !Ref CertParameterName
+          DEFAULT_PROFILES: !Ref DefaultProfiles
+          GENERATE_INCIDENTS: !Ref GenerateIncidents
+      Code:
+        ZipFile: |
+          import json, os, re, ssl, tempfile, urllib.request, urllib.error, hashlib, uuid
+          import base64, mimetypes, concurrent.futures
+          from email import message_from_bytes
+          from email.policy import default as email_default_policy
+
+          CA_CERT_PEM = os.environ.get('CA_CERT_PEM', '')
+          DLP_URL = os.environ['DLP_URL']
+          DEFAULT_PROFILES = os.environ.get('DEFAULT_PROFILES', '')
+          GENERATE_INCIDENTS = os.environ.get('GENERATE_INCIDENTS', 'true')
+
+          # Auth is enforced by API Gateway's JWT authorizer (Cognito
+          # client-credentials) before this Lambda is ever invoked - no
+          # token handling needed here. DLPoD's own API requires no auth
+          # (network isolation is its only access control).
+
+          _cafile = None
+
+          def cafile():
+              global _cafile
+              if _cafile is None:
+                  f = tempfile.NamedTemporaryFile(delete=False, suffix='.pem')
+                  f.write(CA_CERT_PEM.encode())
+                  f.close()
+                  _cafile = f.name
+              return _cafile
+
+          def as_obj(value):
+              # Databricks documents policy_config as an opaque pass-through
+              # it "never parses" - in practice this means it (and possibly
+              # event/config/data) can arrive as a raw JSON-encoded STRING
+              # rather than an already-parsed object. Normalize either shape.
+              if isinstance(value, dict):
+                  return value
+              if isinstance(value, str):
+                  try:
+                      parsed = json.loads(value)
+                      return parsed if isinstance(parsed, dict) else {}
+                  except Exception:
+                      return {}
+              return {}
+
+          def text_from_content(content):
+              # A message's 'content' can be a plain string (Chat Completions)
+              # or a list of typed content blocks (Responses API).
+              if isinstance(content, str):
+                  return content
+              if isinstance(content, list):
+                  return "\n".join(
+                      b.get('text', '') for b in content
+                      if isinstance(b, dict) and isinstance(b.get('text'), str)
+                  )
+              return ''
+
+          def extract_text(ev):
+              # Shape depends on event.type (lowercase, per the Databricks
+              # Partner Integration Guide): tool_call / tool_result /
+              # model_call / model_result. Handles both the Chat Completions
+              # and Responses API payload shapes.
+              t = ev.get('type', '')
+              d = as_obj(ev.get('data'))
+              if t == 'model_call':
+                  turns = d.get('messages') or d.get('input') or []
+                  u = [text_from_content(m.get('content')) for m in turns if isinstance(m, dict) and m.get('role') == 'user']
+                  u = [x for x in u if x]
+                  return "\n".join(u) if u else json.dumps(d)[:4000]
+              if t == 'model_result':
+                  ch = d.get('choices')
+                  if isinstance(ch, list) and ch:
+                      c = [x.get('message', {}).get('content', '') for x in ch if isinstance(x, dict)]
+                      c = [text_from_content(x) if not isinstance(x, str) else x for x in c]
+                      c = [x for x in c if x]
+                      if c:
+                          return "\n".join(c)
+                  out = d.get('output') or []
+                  c = [text_from_content(x.get('content')) for x in out if isinstance(x, dict)]
+                  c = [x for x in c if x]
+                  return "\n".join(c) if c else json.dumps(d)[:4000]
+              if t == 'tool_call':
+                  return json.dumps(d.get('arguments', d))[:4000]
+              return json.dumps(d)[:4000]
+
+          IMAGE_DATA_URI_RE = re.compile(r'^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$', re.DOTALL)
+
+          def images_from_content(content):
+              # Collects image-shaped content blocks from a message's
+              # 'content' list: Chat Completions vision
+              # ({"type": "image_url", "image_url": {"url": ...}}) and
+              # Responses API ({"type": "input_image", "image_url": "..."}).
+              # Returns (mime_type, raw_bytes) for inline base64 data: URIs
+              # (decoded here), or ('url', <url>) for a remote URL, left
+              # unresolved for the caller to fetch (this Lambda has no
+              # guaranteed internet egress - see fetch_image_bytes).
+              images = []
+              if not isinstance(content, list):
+                  return images
+              for b in content:
+                  if not isinstance(b, dict):
+                      continue
+                  btype = b.get('type')
+                  url = None
+                  if btype == 'image_url':
+                      iu = b.get('image_url')
+                      url = iu.get('url') if isinstance(iu, dict) else iu
+                  elif btype == 'input_image':
+                      iu = b.get('image_url')
+                      url = iu if isinstance(iu, str) else (iu.get('url') if isinstance(iu, dict) else None)
+                  if not url or not isinstance(url, str):
+                      continue
+                  m = IMAGE_DATA_URI_RE.match(url)
+                  if m:
+                      mime, b64data = m.group(1), m.group(2)
+                      try:
+                          images.append((mime, base64.b64decode(b64data)))
+                      except Exception:
+                          images.append((mime, None))  # decode failure - flagged by the caller
+                  else:
+                      images.append(('url', url))
+              return images
+
+          def fetch_image_bytes(url, timeout=2):
+              # Best-effort only: this Lambda's VPC attachment is meant for
+              # VPC-local reachability to the DLPoD ALB, not internet
+              # egress (no NAT is required for text-only inspection). A
+              # remote (non data:) image URL will only resolve if the
+              # subnet happens to have internet egress; if not, this raises
+              # and the caller fails closed with a clear DENY reason rather
+              # than silently skipping the image.
+              req = urllib.request.Request(url, headers={'User-Agent': 'DatabricksDLPoDAdapter/1.0'})
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  mime = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
+                  return mime, resp.read()
+
+          def extract_content(ev):
+              # Returns (text, images) for the event. Only 'model_call'
+              # events (the user's turn) are scanned for image content
+              # blocks - model outputs/tool payloads are handled text-only,
+              # same as extract_text() always did, since raw images there
+              # are rare/out of scope for now.
+              t = ev.get('type', '')
+              if t == 'model_call':
+                  d = as_obj(ev.get('data'))
+                  turns = d.get('messages') or d.get('input') or []
+                  texts, images = [], []
+                  for m in turns:
+                      if not isinstance(m, dict) or m.get('role') != 'user':
+                          continue
+                      content = m.get('content')
+                      txt = text_from_content(content)
+                      if txt:
+                          texts.append(txt)
+                      images.extend(images_from_content(content))
+                  if texts:
+                      text = "\n".join(texts)
+                  elif images:
+                      text = ""  # image-only turn - nothing text-shaped to inspect
+                  else:
+                      text = json.dumps(d)[:4000]
+                  return text, images
+              return extract_text(ev), []
+
+          def deny(reason):
+              # Flat {result, reason} - the contract has no wrapper object.
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps({"result": "DENY", "reason": reason}),
+              }
+
+          def build_multipart(profiles, content_bytes, filename, mime_type):
+              # DLPoD sync inspect: multipart/form-data with a 'request' JSON
+              # part and a 'content' binary part. content.id is a required
+              # sha256 hash of the content bytes. Works the same for text
+              # and image bytes - DLPoD's OCR (once the backend feature flag
+              # DLP_DLPAAS_FEATURE_ENABLE_OCR is enabled) extracts text from
+              # image content transparently, same profiles/verdict shape.
+              boundary = uuid.uuid4().hex
+              content_id = hashlib.sha256(content_bytes).hexdigest()
+              req_json = json.dumps({
+                  "profiles": profiles,
+                  "content": {"id": content_id, "name": filename},
+                  "results": {"verdict": "summary"},
+                  "sender": {"app_name": "DatabricksAIGateway"},
+              })
+              parts = [
+                  (f'--{boundary}\r\n'
+                   'Content-Disposition: form-data; name="request"\r\n'
+                   'Content-Type: application/json\r\n\r\n'
+                   f'{req_json}\r\n').encode(),
+                  (f'--{boundary}\r\n'
+                   f'Content-Disposition: form-data; name="content"; filename="{filename}"\r\n'
+                   f'Content-Type: {mime_type}\r\n\r\n').encode() + content_bytes + b'\r\n',
+                  f'--{boundary}--\r\n'.encode(),
+              ]
+              return b''.join(parts), boundary
+
+          def parse_multipart_response(content_type, body_bytes):
+              # Use the stdlib email parser to walk a multipart/mixed body -
+              # avoids needing a multipart-parsing library.
+              header = f'Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n'.encode()
+              try:
+                  msg = message_from_bytes(header + body_bytes, policy=email_default_policy)
+                  for part in msg.walk():
+                      if part.get_content_type() == 'application/json':
+                          return json.loads(part.get_payload(decode=True))
+              except Exception:
+                  pass
+              # Fallback: maybe the server just sent plain JSON.
+              try:
+                  return json.loads(body_bytes)
+              except Exception:
+                  return {}
+
+          def inspect_item(profiles, content_bytes, filename, mime_type):
+              # One synchronous DLPoD /inspections call for one content item
+              # (text or image). Raises on transport/HTTP errors - the
+              # caller decides how to fail closed.
+              multipart_body, boundary = build_multipart(profiles, content_bytes, filename, mime_type)
+              ctx = ssl.create_default_context(cafile=cafile())
+              req = urllib.request.Request(
+                  DLP_URL, data=multipart_body, method='POST',
+                  headers={
+                      'Content-Type': f'multipart/form-data; boundary={boundary}',
+                      'accept': 'multipart/mixed',
+                      # Without this header, DLPoD inspects and verdicts
+                      # normally but does NOT post alerts/incidents to the
+                      # management plane - matches still correctly DENY, but
+                      # nothing shows up in SkopeIT. GenerateIncidents
+                      # (default true) controls this per-deployment.
+                      'x-netskope-generate-incidents': GENERATE_INCIDENTS,
+                  },
+              )
+              # DLPoD's documented server-side timeout is 10s; we time out at
+              # 4s to fail fast within Databricks' ~5s platform budget rather
+              # than risk Databricks cutting us off with less useful
+              # diagnostics. When a turn has both text and image content, all
+              # inspect_item() calls run concurrently (ThreadPoolExecutor) so
+              # this 4s budget applies to the whole batch, not per-item.
+              with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
+                  resp_content_type = resp.headers.get('Content-Type', '')
+                  incidents_posted = resp.headers.get('x-netskope-incidents-posted', '')
+                  resp_bytes = resp.read()
+              result = parse_multipart_response(resp_content_type, resp_bytes)
+              result_data = result.get('result_data', result)
+              if isinstance(result_data, dict):
+                  result_data['_incidents_posted'] = incidents_posted
+              return result_data
+
+          def handler(event, context):
+              try:
+                  body = json.loads(event.get('body') or '{}')
+                  ev = as_obj(body.get('event'))
+                  cfg = as_obj(body.get('config'))
+                  # Customer-facing config lives under config.policy_config
+                  # (an opaque pass-through Databricks never parses); we
+                  # define 'profiles' as the key our evaluator looks for -
+                  # accepts a JSON array or a comma-separated string.
+                  policy_config = as_obj(cfg.get('policy_config'))
+                  profiles_raw = policy_config.get('profiles') or DEFAULT_PROFILES
+                  if isinstance(profiles_raw, str):
+                      profiles = [p.strip() for p in profiles_raw.split(',') if p.strip()]
+                  elif isinstance(profiles_raw, list):
+                      profiles = [p for p in profiles_raw if isinstance(p, str) and p]
+                  else:
+                      profiles = []
+                  if not profiles:
+                      return deny("DLPoD: no profiles configured in policy_config")
+
+                  text, images = extract_content(ev)
+
+                  # Build one inspection task per content item: the combined
+                  # prompt text (if any), plus one per image found in the
+                  # user's turn. DLPoD's /inspections API inspects exactly
+                  # one piece of content per call, so a mixed text+image
+                  # message needs multiple calls - run concurrently below so
+                  # latency doesn't stack.
+                  tasks = []
+                  if text:
+                      text_bytes = text.encode('utf-8')[:1_000_000]  # DLPoD sync limit is 1 MB
+                      tasks.append(('text', text_bytes, 'prompt.txt', 'text/plain'))
+
+                  for idx, (mime, payload) in enumerate(images):
+                      if mime == 'url':
+                          try:
+                              mime, payload = fetch_image_bytes(payload)
+                          except Exception as e:
+                              return deny(f"DLPoD: could not fetch image content for inspection ({e})")
+                      if payload is None:
+                          return deny("DLPoD: could not decode image content for inspection")
+                      if len(payload) > 1_000_000:  # DLPoD sync limit is 1 MB
+                          return deny("DLPoD: image content exceeds 1MB inspection limit")
+                      ext = mimetypes.guess_extension(mime) or '.bin'
+                      tasks.append(('image', payload, f'content{idx}{ext}', mime))
+
+                  if not tasks:
+                      return {
+                          "statusCode": 200,
+                          "headers": {"Content-Type": "application/json"},
+                          "body": json.dumps({"result": "ALLOW", "reason": ""}),
+                      }
+
+                  results = []
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+                      futures = {
+                          ex.submit(inspect_item, profiles, cb, fn, mt): (kind, fn)
+                          for kind, cb, fn, mt in tasks
+                      }
+                      for fut in concurrent.futures.as_completed(futures):
+                          kind, fn = futures[fut]
+                          results.append((kind, fn, fut.result()))
+              except urllib.error.HTTPError as e:
+                  return deny(f"DLPoD unavailable: HTTP {e.code}")
+              except Exception as e:
+                  # Fail closed - matches the Databricks contract (timeout,
+                  # error, or unrecognized verdict all fail closed on their
+                  # side regardless, but we return a clean DENY + reason
+                  # ourselves whenever we can).
+                  return deny(f"DLPoD unavailable: {e}")
+
+              for kind, fn, result_data in results:
+                  status = result_data.get('status')
+                  summary = result_data.get('summary', {})
+                  verdict = summary.get('verdict')
+
+                  if status != 'success':
+                      return deny(f"DLPoD: inspection status '{status}' ({kind}: {fn})")
+
+                  if verdict == 'hit':
+                      severity = summary.get('severity')
+                      matched_profiles = summary.get('profiles', [])
+                      profiles_str = ",".join(matched_profiles) if matched_profiles else 'n/a'
+                      # 'severity' is only populated when the request asks for
+                      # results.verdict="details" rather than "summary" - omit
+                      # the clause cleanly rather than print a fake value.
+                      severity_clause = f", severity={severity}" if severity else ""
+                      # Surface whether DLPoD actually posted this to the
+                      # management plane (x-netskope-incidents-posted) so a
+                      # "why isn't this in SkopeIT" question can be answered
+                      # from the Databricks-side DENY reason alone.
+                      incidents_posted = result_data.get('_incidents_posted', '')
+                      incidents_clause = f", incident_posted={incidents_posted}" if incidents_posted else ""
+                      return deny(f"Blocked: DLP match in {kind} content (profiles={profiles_str}{severity_clause}{incidents_clause})")
+                  elif verdict != 'no_hit':
+                      return deny(f"DLPoD: unexpected verdict '{verdict}' ({kind}: {fn})")
+
+              # Every content item (text and/or each image) came back no_hit.
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps({"result": "ALLOW", "reason": ""}),
+              }
+
+  # HTTP API + Lambda proxy integration, gated by a Cognito JWT authorizer.
+  # (A plain Lambda Function URL with AuthType: NONE was found in earlier
+  # testing to get a blanket 403 from this account/org regardless of
+  # resource policy - a common enterprise guardrail against public,
+  # unauthenticated Function URLs. API Gateway invokes via the
+  # apigateway.amazonaws.com service principal instead of a public "*"
+  # principal, which sidesteps that guardrail, and separately gives us the
+  # JWT authorizer this contract requires anyway.)
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: databricks-dlpod-adapter
+      ProtocolType: HTTP
+
+  HttpApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: cognito-client-credentials
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${AdapterUserPool}'
+        Audience:
+          - !Ref AdapterAppClient
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AdapterFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /'
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref HttpApiAuthorizer
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  HttpApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdapterFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+Outputs:
+  AdapterHost:
+    Description: >
+      Host for the Databricks UC HTTP Connection (scheme + host only; leave
+      the connection's 'path' field blank/'/').
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  OAuthClientId:
+    Description: OAuth M2M Client ID for the UC HTTP Connection.
+    Value: !Ref AdapterAppClient
+
+  OAuthTokenEndpoint:
+    Description: OAuth M2M Token endpoint URL for the UC HTTP Connection.
+    Value: !Sub 'https://databricks-dlpod-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+
+  OAuthScope:
+    Description: OAuth scope for the UC HTTP Connection (optional field).
+    Value: 'dlpod/evaluate'
+
+  UserPoolId:
+    Description: >
+      Cognito User Pool ID - needed to retrieve the Client Secret:
+      aws cognito-idp describe-user-pool-client --user-pool-id <this> --client-id <OAuthClientId> --query UserPoolClient.ClientSecret --output text
+    Value: !Ref AdapterUserPool
+
+  AdapterFunctionArn:
+    Value: !GetAtt AdapterFunction.Arn

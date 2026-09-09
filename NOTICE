@@ -1,0 +1,24 @@
+Netskope DLP On Demand — Databricks Unity AI Gateway Adapter
+Copyright 2026 Netskope, Inc.
+
+This repository's CloudFormation template (templates/databricks-adapter.yaml)
+and documentation are original work, built to bridge the Databricks Unity AI
+Gateway "External Policy Direct HTTP API" and the Netskope DLP On Demand
+(DLPoD) sync content inspection REST API. It is not derived from any
+third-party reference architecture.
+
+This repo does not include a Netskope DLPoD appliance deployment — it
+assumes one is already deployed and tethered to your Netskope tenant. It
+pairs with the sibling repo
+[databricks-plugin-netskope-ai-guardrail](https://github.com/sandiegojenkins/databricks-plugin-netskope-ai-guardrail),
+which does include a full appliance deployment (for the separate AI
+Guardrails on Demand product) and whose Guardrails CloudFormation template
+is derived from
+[jharris-ns/AWS-AIGW-Reference-Architecture](https://github.com/jharris-ns/AWS-AIGW-Reference-Architecture)
+(Apache-2.0) — that attribution does not apply to this repo.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use these files except in compliance with the License. You may obtain a copy
+of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
